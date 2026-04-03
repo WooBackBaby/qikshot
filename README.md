@@ -1,4 +1,4 @@
-# SnapShot
+# Qikshot
 
 A lightweight Chrome extension for capturing, annotating, and downloading screenshots.
 
