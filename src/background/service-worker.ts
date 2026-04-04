@@ -6,7 +6,8 @@ type Message =
   | { type: 'CAPTURE_REGION'; dataUrl: string; cropRect: CropRect }
   | { type: 'OPEN_ANNOTATION'; screenshotId: string }
   | { type: 'START_CROP' }
-  | { type: 'CROP_SELECTED'; cropRect: CropRect };
+  | { type: 'CROP_CAPTURE'; cropRect: CropRect }
+  | { type: 'CROP_DISMISSED' };
 
 interface CropRect {
   x: number;
@@ -16,7 +17,7 @@ interface CropRect {
   devicePixelRatio: number;
 }
 
-chrome.runtime.onMessage.addListener((message: Message, sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message: Message, _sender, sendResponse) => {
   if (message.type === 'CAPTURE_FULL') {
     captureFullTab()
       .then((dataUrl) => sendResponse({ dataUrl }))
@@ -39,11 +40,37 @@ chrome.runtime.onMessage.addListener((message: Message, sender, sendResponse) =>
   }
 
   if (message.type === 'START_CROP') {
-    // Fire-and-forget: popup will close, we save to DB and signal via session storage
-    handleCropFlow(sender).catch(console.error);
-    // Acknowledge immediately so the popup can close
+    startCrop().catch(console.error);
     sendResponse({ ok: true });
     return false;
+  }
+
+  if (message.type === 'CROP_CAPTURE') {
+    handleCropCapture(message.cropRect)
+      .then(() => sendResponse({ ok: true }))
+      .catch((err) => sendResponse({ error: String(err) }));
+    return true;
+  }
+
+  if (message.type === 'CROP_DISMISSED') {
+    chrome.storage.session.remove(['cropTabId', 'cropRect']).catch(() => {});
+    sendResponse({ ok: true });
+    return false;
+  }
+});
+
+// Re-inject overlay when the active crop tab finishes navigating to a new page
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
+  if (changeInfo.status !== 'complete') return;
+  try {
+    const data = await chrome.storage.session.get(['cropTabId', 'cropRect']) as {
+      cropTabId?: number;
+      cropRect?: { x: number; y: number; w: number; h: number };
+    };
+    if (data.cropTabId !== tabId) return;
+    await injectOverlay(tabId, data.cropRect ?? null);
+  } catch {
+    // ignore
   }
 });
 
@@ -56,64 +83,56 @@ async function captureFullTab(): Promise<string> {
   });
 }
 
-async function handleCropFlow(_sender: chrome.runtime.MessageSender) {
+async function startCrop() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.id) return;
-
-  const tabId = tab.id;
   const tabUrl = tab.url ?? '';
-  if (tabUrl.startsWith('chrome://') || tabUrl.startsWith('chrome-extension://') || tabUrl.startsWith('about:')) {
-    return;
-  }
+  if (
+    tabUrl.startsWith('chrome://') ||
+    tabUrl.startsWith('chrome-extension://') ||
+    tabUrl.startsWith('about:')
+  ) return;
+  // Fresh start — clear any saved rect and record the tab
+  try { await chrome.storage.session.remove('cropRect'); } catch {}
+  try { await chrome.storage.session.set({ cropTabId: tab.id }); } catch {}
+  await injectOverlay(tab.id, null);
+}
 
-  // Inject overlay
+// Inject the overlay, optionally pre-seeding a saved rect via a tiny inline initializer.
+// Passing the rect this way avoids any async reads inside the content script itself,
+// which would cause Rollup to wrap the IIFE as async and break event registration.
+async function injectOverlay(
+  tabId: number,
+  savedRect: { x: number; y: number; w: number; h: number } | null
+) {
   try {
+    if (savedRect) {
+      // Set a sync global the content script reads immediately on load
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        func: (r: unknown) => { (window as any).__cropInitRect = r; },
+        args: [savedRect],
+      });
+    }
     await chrome.scripting.executeScript({
       target: { tabId },
       files: ['content/crop-overlay.js'],
     });
   } catch {
-    return;
+    try { await chrome.storage.session.remove(['cropTabId', 'cropRect']); } catch {}
   }
+}
 
-  // Wait for CROP_SELECTED from the content script
-  const cropRect = await waitForCropSelected(tabId);
-  if (!cropRect) return; // user cancelled
-
-  // Capture + crop
+async function handleCropCapture(cropRect: CropRect) {
   const fullDataUrl = await captureFullTab();
   const croppedDataUrl = await cropImage(fullDataUrl, cropRect);
-
-  // Save to IndexedDB
   const screenshot: Screenshot = {
     id: crypto.randomUUID(),
     dataUrl: croppedDataUrl,
     createdAt: Date.now(),
   };
   await saveScreenshot(screenshot);
-
-  // Signal popup to refresh
   await chrome.storage.session.set({ lastSaved: Date.now() });
-}
-
-function waitForCropSelected(tabId: number): Promise<CropRect | null> {
-  return new Promise((resolve) => {
-    // Timeout after 2 minutes (user might not draw a selection)
-    const timeout = setTimeout(() => {
-      chrome.runtime.onMessage.removeListener(listener);
-      resolve(null);
-    }, 120_000);
-
-    function listener(msg: Message, msgSender: chrome.runtime.MessageSender) {
-      if (msg.type !== 'CROP_SELECTED') return;
-      if (msgSender.tab?.id !== tabId) return;
-      clearTimeout(timeout);
-      chrome.runtime.onMessage.removeListener(listener);
-      resolve(msg.cropRect);
-    }
-
-    chrome.runtime.onMessage.addListener(listener);
-  });
 }
 
 async function cropImage(dataUrl: string, rect: CropRect): Promise<string> {
