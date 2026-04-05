@@ -37,7 +37,7 @@ npm run dev
 3. Click **Load unpacked**
 4. Select the `dist/` folder from this project
 
-The SnapShot icon will appear in your toolbar. Click it to open the popup.
+The Qikshot icon will appear in your toolbar. Click it to open the popup.
 
 ## Usage
 
