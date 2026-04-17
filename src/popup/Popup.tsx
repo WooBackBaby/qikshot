@@ -299,6 +299,7 @@ export function Popup() {
                 selected={selected.has(s.id)}
                 onToggle={() => toggleSelect(s.id)}
                 onAnnotate={() => handleAnnotate(s.id)}
+                onDownload={() => downloadSingle(s)}
                 onDelete={() => handleDelete(s.id)}
               />
             ))}

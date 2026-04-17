@@ -6,6 +6,7 @@
 
   const originalScrollY = window.scrollY;
   const originalScrollBehavior = document.documentElement.style.scrollBehavior;
+  const originalOpacity = document.documentElement.style.opacity;
   let scrollbarStyle: HTMLStyleElement | null = null;
 
   interface SavedElement {
@@ -47,6 +48,11 @@
     const viewportWidth = window.innerWidth;
     const viewportHeight = window.innerHeight;
 
+    // Hide the page during the pre-scroll pass so the user doesn't see the page
+    // jumping to the bottom and back. opacity:0 keeps layout intact and lets
+    // IntersectionObserver / native lazy-loading still fire normally.
+    document.documentElement.style.opacity = '0';
+
     // Silent pre-scroll pass to trigger lazy-loaded content
     {
       let y = 0;
@@ -59,7 +65,8 @@
       await wait(300);
     }
 
-    // Hide all fixed/sticky elements so they only appear once
+    // Hide all fixed/sticky elements while the page is still invisible,
+    // so the user never sees the navbars/headers disappear.
     const allEls = document.querySelectorAll<HTMLElement>('*');
     for (const el of Array.from(allEls)) {
       const cs = getComputedStyle(el);
@@ -79,6 +86,10 @@
     }
 
     const totalHeight = document.documentElement.scrollHeight;
+
+    // Restore visibility before captures — captureVisibleTab needs the page rendered.
+    document.documentElement.style.opacity = originalOpacity;
+    await waitFrame(); // give the browser one frame to composite
 
     // Tell the background to prepare for this capture session.
     // Each chunk is captured and drawn directly in the service worker so we never
@@ -144,7 +155,8 @@
     if (scrollbarStyle?.parentNode) {
       scrollbarStyle.parentNode.removeChild(scrollbarStyle);
     }
-    // Restore original scroll behavior and position
+    // Restore original opacity, scroll behavior, and position
+    document.documentElement.style.opacity = originalOpacity;
     document.documentElement.style.scrollBehavior = originalScrollBehavior;
     instantScrollTo(originalScrollY);
     delete (window as any).__qikshotScrollCapture;

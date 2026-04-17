@@ -6,6 +6,7 @@ interface Props {
   selected: boolean;
   onToggle: () => void;
   onAnnotate: () => void;
+  onDownload: () => void;
   onDelete: () => void;
 }
 
@@ -20,21 +21,25 @@ function relativeTime(ms: number): string {
   return `${Math.floor(h / 24)}d ago`;
 }
 
-export function ScreenshotCard({ screenshot, selected, onToggle, onAnnotate, onDelete }: Props) {
+export function ScreenshotCard({ screenshot, selected, onToggle, onAnnotate, onDownload, onDelete }: Props) {
   const thumbUrl = screenshot.annotatedUrl ?? screenshot.dataUrl;
 
   return (
     <div
       className={[
-        'flex items-center gap-3 px-3 py-2 rounded-lg transition-colors group',
+        'flex items-center gap-3 px-3 py-2 rounded-lg transition-colors group cursor-default',
         selected ? 'bg-zinc-800/80 ring-1 ring-violet-500/40' : 'hover:bg-zinc-800/50',
       ].join(' ')}
+      // Double-click anywhere on the card (outside action buttons) opens annotate
+      onDoubleClick={onAnnotate}
     >
-      {/* Checkbox */}
+      {/* Checkbox — stop double-click bubbling to avoid opening annotate */}
       <input
         type="checkbox"
         checked={selected}
         onChange={onToggle}
+        onClick={(e) => e.stopPropagation()}
+        onDoubleClick={(e) => e.stopPropagation()}
         className="w-3.5 h-3.5 rounded accent-violet-500 flex-shrink-0 cursor-pointer"
       />
 
@@ -60,14 +65,25 @@ export function ScreenshotCard({ screenshot, selected, onToggle, onAnnotate, onD
         )}
       </div>
 
-      {/* Actions */}
-      <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+      {/* Actions — stop double-click on each button so they don't open annotate */}
+      <div
+        className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity"
+        onDoubleClick={(e) => e.stopPropagation()}
+      >
         <Tooltip content="Annotate">
           <button
             onClick={onAnnotate}
             className="p-1.5 rounded hover:bg-zinc-700 text-zinc-400 hover:text-zinc-100 transition-colors"
           >
             <PencilIcon />
+          </button>
+        </Tooltip>
+        <Tooltip content="Download">
+          <button
+            onClick={onDownload}
+            className="p-1.5 rounded hover:bg-zinc-700 text-zinc-400 hover:text-zinc-100 transition-colors"
+          >
+            <DownloadIcon />
           </button>
         </Tooltip>
         <Tooltip content="Delete">
@@ -88,6 +104,16 @@ function PencilIcon() {
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
       <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
+    </svg>
+  );
+}
+
+function DownloadIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+      <polyline points="7 10 12 15 17 10" />
+      <line x1="12" y1="15" x2="12" y2="3" />
     </svg>
   );
 }

@@ -16,6 +16,7 @@ export function AnnotationEditor() {
   const [canRedo, setCanRedo] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveMsg, setSaveMsg] = useState('');
+  const [zoomLevel, setZoomLevel] = useState(1);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -25,6 +26,7 @@ export function AnnotationEditor() {
   const startPosRef = useRef({ x: 0, y: 0 });
   const snapshotRef = useRef<ImageData | null>(null); // snapshot before current stroke
   const textInputRef = useRef<HTMLInputElement | null>(null);
+  const fitScaleRef = useRef(1); // initial scale that fits the image to the container
 
   // Load screenshot on mount
   useEffect(() => {
@@ -49,6 +51,7 @@ export function AnnotationEditor() {
       const cw = container.clientWidth;
       const ch = container.clientHeight;
       const scale = Math.min(cw / img.width, ch / img.height, 1);
+      fitScaleRef.current = scale;
       canvas.width = img.width;
       canvas.height = img.height;
       canvas.style.width = img.width * scale + 'px';
@@ -59,6 +62,15 @@ export function AnnotationEditor() {
     };
     img.src = screenshot.annotatedUrl ?? screenshot.dataUrl;
   }, [screenshot]);
+
+  // Apply zoom whenever zoomLevel changes
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !fitScaleRef.current) return;
+    const s = fitScaleRef.current * zoomLevel;
+    canvas.style.width = canvas.width * s + 'px';
+    canvas.style.height = canvas.height * s + 'px';
+  }, [zoomLevel]);
 
   function pushHistory() {
     const canvas = canvasRef.current;
@@ -415,19 +427,42 @@ export function AnnotationEditor() {
       {/* Main area */}
       <div className="flex-1 flex flex-col overflow-hidden">
         {/* Top bar */}
-        <div className="flex items-center justify-between px-4 py-2.5 bg-white border-b border-zinc-200 flex-shrink-0">
+        <div className="flex items-center justify-between px-4 py-2.5 bg-white border-b border-zinc-200 flex-shrink-0 gap-4">
           <button
             onClick={() => window.close()}
-            className="flex items-center gap-1.5 text-sm text-zinc-600 hover:text-zinc-900 transition-colors"
+            className="flex items-center gap-1.5 text-sm text-zinc-600 hover:text-zinc-900 transition-colors flex-shrink-0"
           >
             <BackIcon /> Back
           </button>
-          <div className="text-sm text-zinc-500">
-            {screenshot?.label ?? 'Screenshot'}
+
+          {/* Zoom controls */}
+          <div className="flex items-center gap-1 bg-zinc-100 rounded-md px-1 py-0.5">
+            <button
+              onClick={() => setZoomLevel((z) => Math.max(+(z - 0.25).toFixed(2), 0.25))}
+              className="w-6 h-6 flex items-center justify-center rounded text-zinc-600 hover:bg-zinc-200 hover:text-zinc-900 transition-colors text-base font-medium leading-none"
+              title="Zoom out"
+            >
+              −
+            </button>
+            <button
+              onClick={() => setZoomLevel(1)}
+              className="min-w-[44px] text-center text-xs font-medium text-zinc-600 hover:text-zinc-900 transition-colors px-1"
+              title="Reset zoom"
+            >
+              {Math.round(zoomLevel * 100)}%
+            </button>
+            <button
+              onClick={() => setZoomLevel((z) => Math.min(+(z + 0.25).toFixed(2), 4))}
+              className="w-6 h-6 flex items-center justify-center rounded text-zinc-600 hover:bg-zinc-200 hover:text-zinc-900 transition-colors text-base font-medium leading-none"
+              title="Zoom in"
+            >
+              +
+            </button>
           </div>
+
           <button
             onClick={handleDownload}
-            className="flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-md bg-zinc-100 hover:bg-zinc-200 text-zinc-700 transition-colors"
+            className="flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-md bg-zinc-100 hover:bg-zinc-200 text-zinc-700 transition-colors flex-shrink-0"
           >
             <DownloadIconSmall /> Download
           </button>
