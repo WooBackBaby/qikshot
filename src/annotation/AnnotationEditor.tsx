@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { getScreenshot, updateScreenshot, type Screenshot } from '../lib/db';
-import { downloadSingle } from '../lib/download';
+import { downloadSingle, type ImageFormat, FORMAT_STORAGE_KEY } from '../lib/download';
 
 type Tool = 'select' | 'arrow' | 'rect' | 'text' | 'freehand' | 'eraser' | 'hand';
 
@@ -20,6 +20,7 @@ export function AnnotationEditor() {
   const [canRedo, setCanRedo] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveMsg, setSaveMsg] = useState('');
+  const [format, setFormat] = useState<ImageFormat>('png');
 
   // View state (zoom + pan) — stored in both state (for render) and refs (for event handlers)
   const [viewState, setViewState] = useState({ zoom: 1, pan: { x: 0, y: 0 } });
@@ -69,7 +70,16 @@ export function AnnotationEditor() {
     const id = params.get('id');
     if (!id) return;
     getScreenshot(id).then((s) => { if (s) setScreenshot(s); });
+    chrome.storage.local.get(FORMAT_STORAGE_KEY).then((data) => {
+      const saved = data[FORMAT_STORAGE_KEY] as ImageFormat | undefined;
+      if (saved === 'png' || saved === 'jpeg') setFormat(saved);
+    });
   }, []);
+
+  function saveFormat(f: ImageFormat) {
+    setFormat(f);
+    chrome.storage.local.set({ [FORMAT_STORAGE_KEY]: f });
+  }
 
   // Draw image onto canvas once loaded
   useEffect(() => {
@@ -404,7 +414,7 @@ export function AnnotationEditor() {
     const canvas = canvasRef.current;
     if (!canvas || !screenshot) return;
     const annotatedUrl = canvas.toDataURL('image/png');
-    await downloadSingle({ ...screenshot, annotatedUrl });
+    await downloadSingle({ ...screenshot, annotatedUrl }, format);
   }
 
   // ── Tool definitions ──────────────────────────────────────────────────────
@@ -565,9 +575,31 @@ export function AnnotationEditor() {
             className="w-full py-2.5 rounded-lg text-sm font-medium bg-violet-600 hover:bg-violet-700 text-white disabled:opacity-50 transition-colors">
             {saveMsg || (saving ? 'Saving…' : 'Save annotation')}
           </button>
+          {/* Format toggle */}
+          <div className="flex rounded overflow-hidden border border-zinc-600 text-xs">
+            <button
+              onClick={() => saveFormat('png')}
+              className={[
+                'flex-1 py-1.5 transition-colors',
+                format === 'png' ? 'bg-violet-600 text-white' : 'bg-zinc-700 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-600',
+              ].join(' ')}
+            >
+              PNG
+            </button>
+            <div className="w-px bg-zinc-600" />
+            <button
+              onClick={() => saveFormat('jpeg')}
+              className={[
+                'flex-1 py-1.5 transition-colors',
+                format === 'jpeg' ? 'bg-violet-600 text-white' : 'bg-zinc-700 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-600',
+              ].join(' ')}
+            >
+              JPG
+            </button>
+          </div>
           <button onClick={handleDownload}
             className="w-full py-2.5 rounded-lg text-sm font-medium bg-zinc-700 hover:bg-zinc-600 text-zinc-200 transition-colors">
-            Download PNG
+            Download {format === 'jpeg' ? 'JPG' : 'PNG'}
           </button>
         </div>
       </div>
@@ -584,7 +616,7 @@ export function AnnotationEditor() {
           <div className="text-sm text-zinc-500">{screenshot?.label ?? 'Screenshot'}</div>
           <button onClick={handleDownload}
             className="flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-md bg-zinc-100 hover:bg-zinc-200 text-zinc-700 transition-colors">
-            <DownloadIconSmall /> Download
+            <DownloadIconSmall /> Download {format === 'jpeg' ? 'JPG' : 'PNG'}
           </button>
         </div>
 

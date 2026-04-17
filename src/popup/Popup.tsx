@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { getAllScreenshots, deleteScreenshot, clearAll, type Screenshot } from '../lib/db';
 import { captureAndSave } from '../lib/screenshot';
-import { downloadSingle, downloadAll } from '../lib/download';
+import { downloadSingle, downloadAll, type ImageFormat, FORMAT_STORAGE_KEY } from '../lib/download';
 import { ScreenshotCard } from '../components/ScreenshotCard';
 import { Button } from '../components/Button';
 
@@ -20,6 +20,7 @@ export function Popup() {
   const [scrollProgress, setScrollProgress] = useState<{ current: number; total: number } | null>(null);
   const [toast, setToast] = useState<Toast | null>(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [format, setFormat] = useState<ImageFormat>('png');
   const toastTimer = useRef<ReturnType<typeof setTimeout>>();
   const scrollPortRef = useRef<chrome.runtime.Port | null>(null);
 
@@ -30,7 +31,16 @@ export function Popup() {
 
   useEffect(() => {
     loadScreenshots();
+    chrome.storage.local.get(FORMAT_STORAGE_KEY).then((data) => {
+      const saved = data[FORMAT_STORAGE_KEY] as ImageFormat | undefined;
+      if (saved === 'png' || saved === 'jpeg') setFormat(saved);
+    });
   }, [loadScreenshots]);
+
+  function saveFormat(f: ImageFormat) {
+    setFormat(f);
+    chrome.storage.local.set({ [FORMAT_STORAGE_KEY]: f });
+  }
 
   // Poll chrome.storage.session for annotation saves and crop captures
   useEffect(() => {
@@ -193,17 +203,17 @@ export function Popup() {
   async function handleDownloadSelected() {
     const items = screenshots.filter((s) => selected.has(s.id));
     if (items.length === 1) {
-      await downloadSingle(items[0]);
+      await downloadSingle(items[0], format);
     } else {
-      await downloadAll(items);
+      await downloadAll(items, format);
     }
   }
 
   async function handleDownloadAll() {
     if (screenshots.length === 1) {
-      await downloadSingle(screenshots[0]);
+      await downloadSingle(screenshots[0], format);
     } else {
-      await downloadAll(screenshots);
+      await downloadAll(screenshots, format);
     }
   }
 
@@ -299,7 +309,7 @@ export function Popup() {
                 selected={selected.has(s.id)}
                 onToggle={() => toggleSelect(s.id)}
                 onAnnotate={() => handleAnnotate(s.id)}
-                onDownload={() => downloadSingle(s)}
+                onDownload={() => downloadSingle(s, format)}
                 onDelete={() => handleDelete(s.id)}
               />
             ))}
@@ -322,6 +332,28 @@ export function Popup() {
           )}
         </div>
         <div className="flex items-center gap-1.5">
+          {/* Format toggle */}
+          <div className="flex rounded overflow-hidden border border-zinc-700 text-xs mr-0.5">
+            <button
+              onClick={() => saveFormat('png')}
+              className={[
+                'px-2 py-1 transition-colors',
+                format === 'png' ? 'bg-violet-600 text-white' : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800',
+              ].join(' ')}
+            >
+              PNG
+            </button>
+            <div className="w-px bg-zinc-700" />
+            <button
+              onClick={() => saveFormat('jpeg')}
+              className={[
+                'px-2 py-1 transition-colors',
+                format === 'jpeg' ? 'bg-violet-600 text-white' : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800',
+              ].join(' ')}
+            >
+              JPG
+            </button>
+          </div>
           {selected.size > 0 && (
             <Button
               variant="danger"
