@@ -25,9 +25,11 @@ export function AnnotationEditor() {
   const [viewState, setViewState] = useState({ zoom: 1, pan: { x: 0, y: 0 } });
   const [fitScale, setFitScale] = useState(1);
   const [isPanning, setIsPanning] = useState(false);
+  const [spacebarHeld, setSpacebarHeld] = useState(false);
   const zoomRef = useRef(1);
   const panRef = useRef({ x: 0, y: 0 });
   const fitScaleRef = useRef(1);
+  const spacebarRef = useRef(false);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const canvasWrapRef = useRef<HTMLDivElement>(null);
@@ -97,7 +99,7 @@ export function AnnotationEditor() {
     img.src = screenshot.annotatedUrl ?? screenshot.dataUrl;
   }, [screenshot]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Scroll-wheel zoom (non-passive so preventDefault works) ──────────────
+  // ── Scroll-wheel / trackpad zoom+pan (non-passive so preventDefault works) ─
 
   useEffect(() => {
     const container = containerRef.current;
@@ -105,24 +107,68 @@ export function AnnotationEditor() {
 
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
-      const rect = container.getBoundingClientRect();
-      // Mouse offset from container center (the transform origin)
-      const dx = e.clientX - rect.left - rect.width / 2;
-      const dy = e.clientY - rect.top - rect.height / 2;
-      const delta = e.deltaY < 0 ? ZOOM_STEP_WHEEL : -ZOOM_STEP_WHEEL;
-      const newZoom = Math.min(Math.max(+(zoomRef.current + delta).toFixed(3), ZOOM_MIN), ZOOM_MAX);
-      // Adjust pan so the canvas point under the cursor stays fixed
-      const ratio = newZoom / zoomRef.current;
-      const newPan = {
-        x: dx * (1 - ratio) + panRef.current.x * ratio,
-        y: dy * (1 - ratio) + panRef.current.y * ratio,
-      };
-      applyView(newZoom, newPan);
+
+      if (e.ctrlKey) {
+        // Pinch-to-zoom (trackpad) or Ctrl+scroll — smooth proportional zoom
+        const factor = 1 - e.deltaY * 0.008;
+        const newZoom = Math.min(Math.max(+(zoomRef.current * factor).toFixed(3), ZOOM_MIN), ZOOM_MAX);
+        const rect = container.getBoundingClientRect();
+        const dx = e.clientX - rect.left - rect.width / 2;
+        const dy = e.clientY - rect.top - rect.height / 2;
+        const ratio = newZoom / zoomRef.current;
+        applyView(newZoom, {
+          x: dx * (1 - ratio) + panRef.current.x * ratio,
+          y: dy * (1 - ratio) + panRef.current.y * ratio,
+        });
+      } else if (e.deltaX !== 0) {
+        // Trackpad two-finger scroll with a horizontal component → pan
+        applyView(zoomRef.current, {
+          x: panRef.current.x - e.deltaX,
+          y: panRef.current.y - e.deltaY,
+        });
+      } else {
+        // Vertical-only scroll (mouse wheel or pure-vertical trackpad) → zoom
+        const rect = container.getBoundingClientRect();
+        const dx = e.clientX - rect.left - rect.width / 2;
+        const dy = e.clientY - rect.top - rect.height / 2;
+        const delta = e.deltaY < 0 ? ZOOM_STEP_WHEEL : -ZOOM_STEP_WHEEL;
+        const newZoom = Math.min(Math.max(+(zoomRef.current + delta).toFixed(3), ZOOM_MIN), ZOOM_MAX);
+        const ratio = newZoom / zoomRef.current;
+        applyView(newZoom, {
+          x: dx * (1 - ratio) + panRef.current.x * ratio,
+          y: dy * (1 - ratio) + panRef.current.y * ratio,
+        });
+      }
     };
 
     container.addEventListener('wheel', onWheel, { passive: false });
     return () => container.removeEventListener('wheel', onWheel);
   }, []); // refs are always current — empty deps is intentional
+
+  // ── Spacebar pan (hold space = temporary pan mode) ────────────────────────
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      // Ignore if focus is inside a text input or the text tool's floating input
+      if (e.code !== 'Space' || e.repeat) return;
+      const tag = (e.target as HTMLElement).tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+      e.preventDefault();
+      spacebarRef.current = true;
+      setSpacebarHeld(true);
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.code !== 'Space') return;
+      spacebarRef.current = false;
+      setSpacebarHeld(false);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+    };
+  }, []);
 
   // ── History ───────────────────────────────────────────────────────────────
 
@@ -222,7 +268,7 @@ export function AnnotationEditor() {
   }
 
   function onMouseDown(e: React.MouseEvent<HTMLCanvasElement>) {
-    if (tool === 'hand') { startPan(e.clientX, e.clientY); return; }
+    if (tool === 'hand' || spacebarRef.current) { startPan(e.clientX, e.clientY); return; }
     if (tool === 'text') { handleTextTool(e); return; }
     const pos = toCanvasCoords(e);
     startPosRef.current = pos;
@@ -373,7 +419,7 @@ export function AnnotationEditor() {
   ];
 
   const totalScale = fitScale * viewState.zoom;
-  const canvasCursor = tool === 'hand'
+  const canvasCursor = (tool === 'hand' || spacebarHeld)
     ? (isPanning ? 'grabbing' : 'grab')
     : tool === 'text' ? 'text'
     : tool === 'select' ? 'default'
