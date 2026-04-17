@@ -1,11 +1,15 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { getScreenshot, updateScreenshot, type Screenshot } from '../lib/db';
 import { downloadSingle } from '../lib/download';
 
-type Tool = 'select' | 'arrow' | 'rect' | 'text' | 'freehand' | 'eraser';
+type Tool = 'select' | 'arrow' | 'rect' | 'text' | 'freehand' | 'eraser' | 'hand';
 
 const PRESET_COLORS = ['#ef4444', '#f97316', '#eab308', '#22c55e', '#3b82f6', '#ffffff'];
 const MAX_HISTORY = 30;
+const ZOOM_MIN = 0.1;
+const ZOOM_MAX = 8;
+const ZOOM_STEP_BTN = 0.25;
+const ZOOM_STEP_WHEEL = 0.08;
 
 export function AnnotationEditor() {
   const [screenshot, setScreenshot] = useState<Screenshot | null>(null);
@@ -16,26 +20,53 @@ export function AnnotationEditor() {
   const [canRedo, setCanRedo] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveMsg, setSaveMsg] = useState('');
-  const [zoomLevel, setZoomLevel] = useState(1);
+
+  // View state (zoom + pan) — stored in both state (for render) and refs (for event handlers)
+  const [viewState, setViewState] = useState({ zoom: 1, pan: { x: 0, y: 0 } });
+  const [fitScale, setFitScale] = useState(1);
+  const [isPanning, setIsPanning] = useState(false);
+  const zoomRef = useRef(1);
+  const panRef = useRef({ x: 0, y: 0 });
+  const fitScaleRef = useRef(1);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const canvasWrapRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const historyRef = useRef<ImageData[]>([]);
   const historyIndexRef = useRef(-1);
   const drawingRef = useRef(false);
   const startPosRef = useRef({ x: 0, y: 0 });
-  const snapshotRef = useRef<ImageData | null>(null); // snapshot before current stroke
+  const snapshotRef = useRef<ImageData | null>(null);
   const textInputRef = useRef<HTMLInputElement | null>(null);
-  const fitScaleRef = useRef(1); // initial scale that fits the image to the container
 
-  // Load screenshot on mount
+  // ── View helpers ─────────────────────────────────────────────────────────
+
+  function applyView(zoom: number, pan: { x: number; y: number }) {
+    const z = Math.min(Math.max(zoom, ZOOM_MIN), ZOOM_MAX);
+    zoomRef.current = z;
+    panRef.current = pan;
+    setViewState({ zoom: z, pan });
+  }
+
+  function resetView() {
+    applyView(1, { x: 0, y: 0 });
+  }
+
+  function zoomIn() {
+    applyView(+(zoomRef.current + ZOOM_STEP_BTN).toFixed(2), panRef.current);
+  }
+
+  function zoomOut() {
+    applyView(+(zoomRef.current - ZOOM_STEP_BTN).toFixed(2), panRef.current);
+  }
+
+  // ── Load screenshot ───────────────────────────────────────────────────────
+
   useEffect(() => {
     const params = new URLSearchParams(location.search);
     const id = params.get('id');
     if (!id) return;
-    getScreenshot(id).then((s) => {
-      if (s) setScreenshot(s);
-    });
+    getScreenshot(id).then((s) => { if (s) setScreenshot(s); });
   }, []);
 
   // Draw image onto canvas once loaded
@@ -52,32 +83,54 @@ export function AnnotationEditor() {
       const ch = container.clientHeight;
       const scale = Math.min(cw / img.width, ch / img.height, 1);
       fitScaleRef.current = scale;
+      setFitScale(scale);
+      // Canvas internal resolution = image natural size
       canvas.width = img.width;
       canvas.height = img.height;
-      canvas.style.width = img.width * scale + 'px';
-      canvas.style.height = img.height * scale + 'px';
-
+      // CSS size = natural px so transform handles all display scaling
+      canvas.style.width = img.width + 'px';
+      canvas.style.height = img.height + 'px';
       ctx.drawImage(img, 0, 0);
       pushHistory();
+      resetView();
     };
     img.src = screenshot.annotatedUrl ?? screenshot.dataUrl;
-  }, [screenshot]);
+  }, [screenshot]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Apply zoom whenever zoomLevel changes
+  // ── Scroll-wheel zoom (non-passive so preventDefault works) ──────────────
+
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas || !fitScaleRef.current) return;
-    const s = fitScaleRef.current * zoomLevel;
-    canvas.style.width = canvas.width * s + 'px';
-    canvas.style.height = canvas.height * s + 'px';
-  }, [zoomLevel]);
+    const container = containerRef.current;
+    if (!container) return;
+
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const rect = container.getBoundingClientRect();
+      // Mouse offset from container center (the transform origin)
+      const dx = e.clientX - rect.left - rect.width / 2;
+      const dy = e.clientY - rect.top - rect.height / 2;
+      const delta = e.deltaY < 0 ? ZOOM_STEP_WHEEL : -ZOOM_STEP_WHEEL;
+      const newZoom = Math.min(Math.max(+(zoomRef.current + delta).toFixed(3), ZOOM_MIN), ZOOM_MAX);
+      // Adjust pan so the canvas point under the cursor stays fixed
+      const ratio = newZoom / zoomRef.current;
+      const newPan = {
+        x: dx * (1 - ratio) + panRef.current.x * ratio,
+        y: dy * (1 - ratio) + panRef.current.y * ratio,
+      };
+      applyView(newZoom, newPan);
+    };
+
+    container.addEventListener('wheel', onWheel, { passive: false });
+    return () => container.removeEventListener('wheel', onWheel);
+  }, []); // refs are always current — empty deps is intentional
+
+  // ── History ───────────────────────────────────────────────────────────────
 
   function pushHistory() {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
     const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    // Trim redo history
     historyRef.current = historyRef.current.slice(0, historyIndexRef.current + 1);
     historyRef.current.push(data);
     if (historyRef.current.length > MAX_HISTORY) historyRef.current.shift();
@@ -119,7 +172,8 @@ export function AnnotationEditor() {
     setCanRedo(false);
   }
 
-  // Canvas coordinate transform (CSS scale → actual canvas pixels)
+  // ── Canvas coordinate transform (accounts for CSS scale via transform) ───
+
   function toCanvasCoords(e: React.MouseEvent<HTMLCanvasElement>): { x: number; y: number } {
     const canvas = canvasRef.current!;
     const rect = canvas.getBoundingClientRect();
@@ -131,35 +185,51 @@ export function AnnotationEditor() {
     };
   }
 
+  // ── Pan (hand tool) ───────────────────────────────────────────────────────
+
+  function startPan(clientX: number, clientY: number) {
+    setIsPanning(true);
+    const startX = clientX, startY = clientY;
+    const startPanX = panRef.current.x, startPanY = panRef.current.y;
+
+    const onMove = (e: MouseEvent) => {
+      applyView(zoomRef.current, {
+        x: startPanX + e.clientX - startX,
+        y: startPanY + e.clientY - startY,
+      });
+    };
+
+    const onUp = () => {
+      setIsPanning(false);
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  }
+
+  // ── Drawing ───────────────────────────────────────────────────────────────
+
   function setupCtx(ctx: CanvasRenderingContext2D) {
     ctx.strokeStyle = tool === 'eraser' ? '#ffffff' : color;
     ctx.fillStyle = color;
     ctx.lineWidth = strokeWidth;
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
-    if (tool === 'eraser') {
-      ctx.globalCompositeOperation = 'source-over';
-      ctx.strokeStyle = '#ffffff';
-    } else {
-      ctx.globalCompositeOperation = 'source-over';
-    }
+    ctx.globalCompositeOperation = 'source-over';
+    if (tool === 'eraser') ctx.strokeStyle = '#ffffff';
   }
 
   function onMouseDown(e: React.MouseEvent<HTMLCanvasElement>) {
-    if (tool === 'text') {
-      handleTextTool(e);
-      return;
-    }
+    if (tool === 'hand') { startPan(e.clientX, e.clientY); return; }
+    if (tool === 'text') { handleTextTool(e); return; }
     const pos = toCanvasCoords(e);
     startPosRef.current = pos;
     drawingRef.current = true;
-
     const canvas = canvasRef.current!;
     const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
-
-    // Snapshot current state for shape preview
     snapshotRef.current = ctx.getImageData(0, 0, canvas.width, canvas.height);
-
     if (tool === 'freehand' || tool === 'eraser') {
       setupCtx(ctx);
       ctx.beginPath();
@@ -173,13 +243,11 @@ export function AnnotationEditor() {
     const canvas = canvasRef.current!;
     const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
     const start = startPosRef.current;
-
     if (tool === 'freehand' || tool === 'eraser') {
       setupCtx(ctx);
       ctx.lineTo(pos.x, pos.y);
       ctx.stroke();
     } else if (tool === 'rect' || tool === 'arrow') {
-      // Restore snapshot and redraw preview
       if (snapshotRef.current) ctx.putImageData(snapshotRef.current, 0, 0);
       setupCtx(ctx);
       ctx.beginPath();
@@ -198,7 +266,6 @@ export function AnnotationEditor() {
     const canvas = canvasRef.current!;
     const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
     const start = startPosRef.current;
-
     if (tool === 'rect') {
       if (snapshotRef.current) ctx.putImageData(snapshotRef.current, 0, 0);
       setupCtx(ctx);
@@ -209,20 +276,16 @@ export function AnnotationEditor() {
       setupCtx(ctx);
       drawArrow(ctx, start.x, start.y, pos.x, pos.y);
     }
-
     pushHistory();
   }
 
   function drawArrow(ctx: CanvasRenderingContext2D, x1: number, y1: number, x2: number, y2: number) {
     const headLen = Math.min(20, Math.hypot(x2 - x1, y2 - y1) * 0.4);
     const angle = Math.atan2(y2 - y1, x2 - x1);
-
     ctx.beginPath();
     ctx.moveTo(x1, y1);
     ctx.lineTo(x2, y2);
     ctx.stroke();
-
-    // Arrowhead
     ctx.beginPath();
     ctx.moveTo(x2, y2);
     ctx.lineTo(x2 - headLen * Math.cos(angle - Math.PI / 6), y2 - headLen * Math.sin(angle - Math.PI / 6));
@@ -237,10 +300,7 @@ export function AnnotationEditor() {
     const rect = canvasRef.current!.getBoundingClientRect();
     const scaleX = rect.width / canvasRef.current!.width;
     const scaleY = rect.height / canvasRef.current!.height;
-
-    // Remove existing text input if any
     textInputRef.current?.remove();
-
     const input = document.createElement('input');
     input.style.cssText = `
       position: fixed;
@@ -257,7 +317,6 @@ export function AnnotationEditor() {
       z-index: 9999;
       min-width: 120px;
     `;
-
     const commit = () => {
       const text = input.value.trim();
       if (text) {
@@ -271,15 +330,14 @@ export function AnnotationEditor() {
       input.remove();
       textInputRef.current = null;
     };
-
-    input.addEventListener('keydown', (ev) => {
-      if (ev.key === 'Enter' || ev.key === 'Escape') commit();
-    });
+    input.addEventListener('keydown', (ev) => { if (ev.key === 'Enter' || ev.key === 'Escape') commit(); });
     input.addEventListener('blur', commit);
     document.body.appendChild(input);
     input.focus();
     textInputRef.current = input;
   }
+
+  // ── Save / Download ───────────────────────────────────────────────────────
 
   async function handleSave() {
     const canvas = canvasRef.current;
@@ -303,7 +361,9 @@ export function AnnotationEditor() {
     await downloadSingle({ ...screenshot, annotatedUrl });
   }
 
-  const tools: { id: Tool; label: string; icon: JSX.Element }[] = [
+  // ── Tool definitions ──────────────────────────────────────────────────────
+
+  const drawTools: { id: Tool; label: string; icon: JSX.Element }[] = [
     { id: 'select', label: 'Select', icon: <SelectIcon /> },
     { id: 'arrow', label: 'Arrow', icon: <ArrowIcon /> },
     { id: 'rect', label: 'Rectangle', icon: <RectIcon /> },
@@ -312,31 +372,89 @@ export function AnnotationEditor() {
     { id: 'eraser', label: 'Eraser', icon: <EraserIcon /> },
   ];
 
+  const totalScale = fitScale * viewState.zoom;
+  const canvasCursor = tool === 'hand'
+    ? (isPanning ? 'grabbing' : 'grab')
+    : tool === 'text' ? 'text'
+    : tool === 'select' ? 'default'
+    : 'crosshair';
+
+  // ── Render ────────────────────────────────────────────────────────────────
+
   return (
     <div className="flex h-screen w-screen bg-zinc-100 overflow-hidden">
-      {/* Sidebar */}
+
+      {/* ── Sidebar ─────────────────────────────────────────────────────── */}
       <div className="w-[240px] flex-shrink-0 bg-zinc-800 flex flex-col text-zinc-100 overflow-y-auto">
         <div className="px-4 py-4 border-b border-zinc-700">
           <div className="text-sm font-semibold text-zinc-200">Annotation Tools</div>
         </div>
 
-        {/* Tools */}
+        {/* Draw tools (2-col grid) */}
         <div className="px-3 py-3 grid grid-cols-2 gap-1.5">
-          {tools.map((t) => (
+          {drawTools.map((t) => (
             <button
               key={t.id}
               onClick={() => setTool(t.id)}
               className={[
                 'flex flex-col items-center gap-1 py-2.5 rounded-lg text-xs font-medium transition-colors',
-                tool === t.id
-                  ? 'bg-violet-600 text-white'
-                  : 'bg-zinc-700 hover:bg-zinc-600 text-zinc-300',
+                tool === t.id ? 'bg-violet-600 text-white' : 'bg-zinc-700 hover:bg-zinc-600 text-zinc-300',
               ].join(' ')}
             >
               {t.icon}
               {t.label}
             </button>
           ))}
+          {/* Hand/Pan tool — full width so it stands apart from draw tools */}
+          <button
+            onClick={() => setTool('hand')}
+            className={[
+              'col-span-2 flex items-center justify-center gap-2 py-2.5 rounded-lg text-xs font-medium transition-colors',
+              tool === 'hand' ? 'bg-violet-600 text-white' : 'bg-zinc-700 hover:bg-zinc-600 text-zinc-300',
+            ].join(' ')}
+          >
+            <HandIcon />
+            Pan / Move
+          </button>
+        </div>
+
+        <div className="h-px bg-zinc-700 mx-3" />
+
+        {/* View / Zoom controls */}
+        <div className="px-3 py-3">
+          <div className="text-xs text-zinc-400 mb-2 font-medium">Zoom</div>
+          <div className="flex items-center gap-1.5 mb-1.5">
+            <button
+              onClick={zoomOut}
+              title="Zoom out"
+              className="w-8 h-8 flex items-center justify-center rounded-lg bg-zinc-700 hover:bg-zinc-600 text-zinc-300 hover:text-white transition-colors flex-shrink-0"
+            >
+              <ZoomOutIcon />
+            </button>
+            {/* Zoom % — click to reset to fit */}
+            <button
+              onClick={resetView}
+              title="Reset to fit"
+              className="flex-1 h-8 flex items-center justify-center rounded-lg bg-zinc-700 hover:bg-zinc-600 text-zinc-300 hover:text-white text-xs font-medium transition-colors tabular-nums"
+            >
+              {Math.round(viewState.zoom * 100)}%
+            </button>
+            <button
+              onClick={zoomIn}
+              title="Zoom in"
+              className="w-8 h-8 flex items-center justify-center rounded-lg bg-zinc-700 hover:bg-zinc-600 text-zinc-300 hover:text-white transition-colors flex-shrink-0"
+            >
+              <ZoomInIcon />
+            </button>
+          </div>
+          <button
+            onClick={resetView}
+            title="Fit image to window"
+            className="w-full h-8 flex items-center justify-center gap-1.5 rounded-lg bg-zinc-700 hover:bg-zinc-600 text-zinc-300 hover:text-white text-xs font-medium transition-colors"
+          >
+            <FitScreenIcon />
+            Fit to screen
+          </button>
         </div>
 
         <div className="h-px bg-zinc-700 mx-3" />
@@ -369,10 +487,7 @@ export function AnnotationEditor() {
         <div className="px-4 py-2">
           <div className="text-xs text-zinc-400 mb-2 font-medium">Stroke — {strokeWidth}px</div>
           <input
-            type="range"
-            min={1}
-            max={8}
-            value={strokeWidth}
+            type="range" min={1} max={8} value={strokeWidth}
             onChange={(e) => setStrokeWidth(Number(e.target.value))}
             className="w-full accent-violet-500"
           />
@@ -382,24 +497,16 @@ export function AnnotationEditor() {
 
         {/* History controls */}
         <div className="px-3 py-3 grid grid-cols-2 gap-1.5">
-          <button
-            onClick={undo}
-            disabled={!canUndo}
-            className="flex items-center justify-center gap-1 py-2 rounded-lg text-xs font-medium bg-zinc-700 hover:bg-zinc-600 text-zinc-300 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-          >
+          <button onClick={undo} disabled={!canUndo}
+            className="flex items-center justify-center gap-1 py-2 rounded-lg text-xs font-medium bg-zinc-700 hover:bg-zinc-600 text-zinc-300 disabled:opacity-40 disabled:cursor-not-allowed transition-colors">
             <UndoIcon /> Undo
           </button>
-          <button
-            onClick={redo}
-            disabled={!canRedo}
-            className="flex items-center justify-center gap-1 py-2 rounded-lg text-xs font-medium bg-zinc-700 hover:bg-zinc-600 text-zinc-300 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-          >
+          <button onClick={redo} disabled={!canRedo}
+            className="flex items-center justify-center gap-1 py-2 rounded-lg text-xs font-medium bg-zinc-700 hover:bg-zinc-600 text-zinc-300 disabled:opacity-40 disabled:cursor-not-allowed transition-colors">
             <RedoIcon /> Redo
           </button>
-          <button
-            onClick={reset}
-            className="col-span-2 flex items-center justify-center gap-1 py-2 rounded-lg text-xs font-medium bg-zinc-700 hover:bg-red-900 text-zinc-300 hover:text-red-300 transition-colors"
-          >
+          <button onClick={reset}
+            className="col-span-2 flex items-center justify-center gap-1 py-2 rounded-lg text-xs font-medium bg-zinc-700 hover:bg-red-900 text-zinc-300 hover:text-red-300 transition-colors">
             Reset all annotations
           </button>
         </div>
@@ -408,84 +515,65 @@ export function AnnotationEditor() {
 
         {/* Save / Download */}
         <div className="px-3 py-3 flex flex-col gap-2 mt-auto">
-          <button
-            onClick={handleSave}
-            disabled={saving}
-            className="w-full py-2.5 rounded-lg text-sm font-medium bg-violet-600 hover:bg-violet-700 text-white disabled:opacity-50 transition-colors"
-          >
+          <button onClick={handleSave} disabled={saving}
+            className="w-full py-2.5 rounded-lg text-sm font-medium bg-violet-600 hover:bg-violet-700 text-white disabled:opacity-50 transition-colors">
             {saveMsg || (saving ? 'Saving…' : 'Save annotation')}
           </button>
-          <button
-            onClick={handleDownload}
-            className="w-full py-2.5 rounded-lg text-sm font-medium bg-zinc-700 hover:bg-zinc-600 text-zinc-200 transition-colors"
-          >
+          <button onClick={handleDownload}
+            className="w-full py-2.5 rounded-lg text-sm font-medium bg-zinc-700 hover:bg-zinc-600 text-zinc-200 transition-colors">
             Download PNG
           </button>
         </div>
       </div>
 
-      {/* Main area */}
+      {/* ── Main area ───────────────────────────────────────────────────── */}
       <div className="flex-1 flex flex-col overflow-hidden">
+
         {/* Top bar */}
-        <div className="flex items-center justify-between px-4 py-2.5 bg-white border-b border-zinc-200 flex-shrink-0 gap-4">
-          <button
-            onClick={() => window.close()}
-            className="flex items-center gap-1.5 text-sm text-zinc-600 hover:text-zinc-900 transition-colors flex-shrink-0"
-          >
+        <div className="flex items-center justify-between px-4 py-2.5 bg-white border-b border-zinc-200 flex-shrink-0">
+          <button onClick={() => window.close()}
+            className="flex items-center gap-1.5 text-sm text-zinc-600 hover:text-zinc-900 transition-colors">
             <BackIcon /> Back
           </button>
-
-          {/* Zoom controls */}
-          <div className="flex items-center gap-1 bg-zinc-100 rounded-md px-1 py-0.5">
-            <button
-              onClick={() => setZoomLevel((z) => Math.max(+(z - 0.25).toFixed(2), 0.25))}
-              className="w-6 h-6 flex items-center justify-center rounded text-zinc-600 hover:bg-zinc-200 hover:text-zinc-900 transition-colors text-base font-medium leading-none"
-              title="Zoom out"
-            >
-              −
-            </button>
-            <button
-              onClick={() => setZoomLevel(1)}
-              className="min-w-[44px] text-center text-xs font-medium text-zinc-600 hover:text-zinc-900 transition-colors px-1"
-              title="Reset zoom"
-            >
-              {Math.round(zoomLevel * 100)}%
-            </button>
-            <button
-              onClick={() => setZoomLevel((z) => Math.min(+(z + 0.25).toFixed(2), 4))}
-              className="w-6 h-6 flex items-center justify-center rounded text-zinc-600 hover:bg-zinc-200 hover:text-zinc-900 transition-colors text-base font-medium leading-none"
-              title="Zoom in"
-            >
-              +
-            </button>
-          </div>
-
-          <button
-            onClick={handleDownload}
-            className="flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-md bg-zinc-100 hover:bg-zinc-200 text-zinc-700 transition-colors flex-shrink-0"
-          >
+          <div className="text-sm text-zinc-500">{screenshot?.label ?? 'Screenshot'}</div>
+          <button onClick={handleDownload}
+            className="flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-md bg-zinc-100 hover:bg-zinc-200 text-zinc-700 transition-colors">
             <DownloadIconSmall /> Download
           </button>
         </div>
 
-        {/* Canvas area */}
+        {/* Canvas area — transform-based zoom+pan, no overflow-auto needed */}
         <div
           ref={containerRef}
-          className="flex-1 overflow-auto bg-zinc-200 flex items-center justify-center"
+          className="flex-1 overflow-hidden bg-zinc-200 relative select-none"
           style={{ minHeight: 0 }}
         >
           {!screenshot ? (
-            <div className="text-zinc-400 text-sm">Loading…</div>
+            <div className="absolute inset-0 flex items-center justify-center text-zinc-400 text-sm">
+              Loading…
+            </div>
           ) : (
-            <canvas
-              ref={canvasRef}
-              style={{ cursor: tool === 'text' ? 'text' : tool === 'select' ? 'default' : 'crosshair', display: 'block' }}
-              className="shadow-2xl"
-              onMouseDown={onMouseDown}
-              onMouseMove={onMouseMove}
-              onMouseUp={onMouseUp}
-              onMouseLeave={(e) => { if (drawingRef.current) onMouseUp(e); }}
-            />
+            <div
+              ref={canvasWrapRef}
+              style={{
+                position: 'absolute',
+                top: '50%',
+                left: '50%',
+                // Center in container, then apply user pan + zoom.
+                // transform-origin defaults to the element's own center.
+                transform: `translate(-50%, -50%) translate(${viewState.pan.x}px, ${viewState.pan.y}px) scale(${totalScale})`,
+              }}
+            >
+              <canvas
+                ref={canvasRef}
+                style={{ cursor: canvasCursor, display: 'block' }}
+                className="shadow-2xl"
+                onMouseDown={onMouseDown}
+                onMouseMove={onMouseMove}
+                onMouseUp={onMouseUp}
+                onMouseLeave={(e) => { if (drawingRef.current) onMouseUp(e); }}
+              />
+            </div>
           )}
         </div>
       </div>
@@ -512,6 +600,18 @@ function PenIcon() {
 }
 function EraserIcon() {
   return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20 20H7L3 16l13-13 7 7-3 3z"/><path d="M6 17l1-1"/></svg>;
+}
+function HandIcon() {
+  return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 11V6a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v0"/><path d="M14 10V4a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v2"/><path d="M10 10.5V6a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v8"/><path d="M18 11a2 2 0 1 1 4 0v3a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15"/></svg>;
+}
+function ZoomInIcon() {
+  return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg>;
+}
+function ZoomOutIcon() {
+  return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="8" y1="11" x2="14" y2="11"/></svg>;
+}
+function FitScreenIcon() {
+  return <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg>;
 }
 function UndoIcon() {
   return <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></svg>;
