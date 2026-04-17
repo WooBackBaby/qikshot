@@ -30,11 +30,13 @@ export default defineConfig({
         annotation: resolve(__dirname, 'src/annotation/index.html'),
         'background/service-worker': resolve(__dirname, 'src/background/service-worker.ts'),
         'content/crop-overlay': resolve(__dirname, 'src/content/crop-overlay.ts'),
+        'content/full-page-capture': resolve(__dirname, 'src/content/full-page-capture.ts'),
       },
       output: {
         entryFileNames: (chunkInfo) => {
           if (chunkInfo.name === 'background/service-worker') return 'background/service-worker.js';
           if (chunkInfo.name === 'content/crop-overlay') return 'content/crop-overlay.js';
+          if (chunkInfo.name === 'content/full-page-capture') return 'content/full-page-capture.js';
           return '[name]/index.js';
         },
         chunkFileNames: 'chunks/[name].js',

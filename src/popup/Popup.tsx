@@ -16,9 +16,13 @@ export function Popup() {
   const [screenshots, setScreenshots] = useState<Screenshot[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [capturing, setCapturing] = useState(false);
+  const [scrollCapturing, setScrollCapturing] = useState(false);
+  const [scrollProgress, setScrollProgress] = useState<{ current: number; total: number } | null>(null);
+  const [confirmLargePage, setConfirmLargePage] = useState<{ totalHeight: number } | null>(null);
   const [toast, setToast] = useState<Toast | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const toastTimer = useRef<ReturnType<typeof setTimeout>>();
+  const scrollPortRef = useRef<chrome.runtime.Port | null>(null);
 
   const loadScreenshots = useCallback(async () => {
     const all = await getAllScreenshots();
@@ -49,7 +53,7 @@ export function Popup() {
     toastTimer.current = setTimeout(() => setToast(null), 2000);
   }
 
-  async function captureFullPage() {
+  async function captureVisible() {
     setCapturing(true);
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -68,6 +72,49 @@ export function Popup() {
     } finally {
       setCapturing(false);
     }
+  }
+
+  function captureScrollPage() {
+    setScrollCapturing(true);
+    setScrollProgress(null);
+
+    const port = chrome.runtime.connect({ name: 'scroll-capture' });
+    scrollPortRef.current = port;
+
+    port.onMessage.addListener((msg: { type: string; current?: number; total?: number; totalHeight?: number; error?: string }) => {
+      if (msg.type === 'SCROLL_PROGRESS') {
+        setScrollProgress({ current: msg.current!, total: msg.total! });
+      } else if (msg.type === 'CONFIRM_LARGE_PAGE') {
+        setConfirmLargePage({ totalHeight: msg.totalHeight! });
+      } else if (msg.type === 'SCROLL_COMPLETE') {
+        port.disconnect();
+        scrollPortRef.current = null;
+        setScrollCapturing(false);
+        setScrollProgress(null);
+        loadScreenshots();
+        showToast('Screenshot saved ✓');
+      } else if (msg.type === 'SCROLL_ERROR') {
+        port.disconnect();
+        scrollPortRef.current = null;
+        setScrollCapturing(false);
+        setScrollProgress(null);
+        showToast('Capture failed — please try again', 'error');
+      }
+    });
+
+    port.onDisconnect.addListener(() => {
+      scrollPortRef.current = null;
+      setScrollCapturing(false);
+      setScrollProgress(null);
+      setConfirmLargePage(null);
+    });
+
+    port.postMessage({ type: 'START_SCROLL_CAPTURE' });
+  }
+
+  function handleLargePageResponse(confirmed: boolean) {
+    setConfirmLargePage(null);
+    scrollPortRef.current?.postMessage({ type: 'LARGE_PAGE_RESPONSE', confirmed });
   }
 
   async function captureCrop() {
@@ -176,18 +223,32 @@ export function Popup() {
       {/* Capture buttons */}
       <div className="px-4 py-3 flex gap-2 flex-shrink-0">
         <button
-          onClick={captureFullPage}
-          disabled={capturing}
+          onClick={captureVisible}
+          disabled={capturing || scrollCapturing}
           className="flex-1 flex flex-col items-center gap-2 py-3 px-2 rounded-lg bg-zinc-900 border border-zinc-800 hover:border-violet-500/50 hover:bg-zinc-800 transition-all disabled:opacity-50 disabled:cursor-not-allowed group"
         >
           <CameraIcon className="text-zinc-400 group-hover:text-violet-400 transition-colors w-5 h-5" />
           <span className="text-xs text-zinc-400 group-hover:text-zinc-200 transition-colors font-medium">
-            Full page
+            Visible
+          </span>
+        </button>
+        <button
+          onClick={captureScrollPage}
+          disabled={capturing || scrollCapturing}
+          className="flex-1 flex flex-col items-center gap-2 py-3 px-2 rounded-lg bg-zinc-900 border border-zinc-800 hover:border-violet-500/50 hover:bg-zinc-800 transition-all disabled:opacity-50 disabled:cursor-not-allowed group"
+        >
+          <ScrollPageIcon className="text-zinc-400 group-hover:text-violet-400 transition-colors w-5 h-5" />
+          <span className="text-xs text-zinc-400 group-hover:text-zinc-200 transition-colors font-medium">
+            {scrollCapturing
+              ? scrollProgress
+                ? `Capturing ${scrollProgress.current} of ${scrollProgress.total}`
+                : 'Starting…'
+              : 'Full page'}
           </span>
         </button>
         <button
           onClick={captureCrop}
-          disabled={capturing}
+          disabled={capturing || scrollCapturing}
           className="flex-1 flex flex-col items-center gap-2 py-3 px-2 rounded-lg bg-zinc-900 border border-zinc-800 hover:border-violet-500/50 hover:bg-zinc-800 transition-all disabled:opacity-50 disabled:cursor-not-allowed group"
         >
           <CropIcon className="text-zinc-400 group-hover:text-violet-400 transition-colors w-5 h-5" />
@@ -196,6 +257,33 @@ export function Popup() {
           </span>
         </button>
       </div>
+
+      {/* Large page confirmation dialog */}
+      {confirmLargePage && (
+        <div className="absolute inset-0 bg-zinc-950/80 flex items-center justify-center z-40 px-6">
+          <div className="bg-zinc-900 border border-zinc-700 rounded-xl p-5 w-full shadow-xl">
+            <p className="text-sm font-semibold text-zinc-100 mb-1">Large page</p>
+            <p className="text-xs text-zinc-400 mb-4">
+              This page is {Math.round(confirmLargePage.totalHeight / 1000)}k px tall. Full capture
+              may take a while and use significant memory.
+            </p>
+            <div className="flex gap-2 justify-end">
+              <button
+                onClick={() => handleLargePageResponse(false)}
+                className="px-3 py-1.5 text-xs rounded-lg bg-zinc-800 text-zinc-300 hover:bg-zinc-700 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => handleLargePageResponse(true)}
+                className="px-3 py-1.5 text-xs rounded-lg bg-violet-600 text-white hover:bg-violet-500 transition-colors"
+              >
+                Capture anyway
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Divider + count */}
       <div className="flex items-center gap-2 px-4 mb-1 flex-shrink-0">
@@ -316,6 +404,16 @@ function CropIcon({ className = '' }: { className?: string }) {
     <svg className={className} width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <polyline points="6 2 6 16 20 16" />
       <polyline points="2 6 16 6 16 20" />
+    </svg>
+  );
+}
+
+function ScrollPageIcon({ className = '' }: { className?: string }) {
+  return (
+    <svg className={className} width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="4" y="2" width="16" height="20" rx="2" />
+      <line x1="12" y1="8" x2="12" y2="16" />
+      <polyline points="9 13 12 16 15 13" />
     </svg>
   );
 }

@@ -7,7 +7,44 @@ type Message =
   | { type: 'OPEN_ANNOTATION'; screenshotId: string }
   | { type: 'START_CROP' }
   | { type: 'CROP_CAPTURE'; cropRect: CropRect }
-  | { type: 'CROP_DISMISSED' };
+  | { type: 'CROP_DISMISSED' }
+  | { type: 'SCROLL_CAPTURE_CHUNK' }
+  | { type: 'SCROLL_PROGRESS'; current: number; total: number }
+  | { type: 'SCROLL_CONFIRM_LARGE'; totalHeight: number }
+  | { type: 'SCROLL_STITCH_CHUNKS'; chunks: Array<{ dataUrl: string; scrollY: number }>; totalHeight: number; viewportWidth: number; dpr: number }
+  | { type: 'SCROLL_ERROR'; error: string };
+
+// Long-lived port from the popup for scroll capture progress/control.
+// Keeping the port open prevents the service worker from going idle mid-capture.
+let scrollCapturePort: chrome.runtime.Port | null = null;
+let pendingLargePageConfirm: ((confirmed: boolean) => void) | null = null;
+
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== 'scroll-capture') return;
+
+  scrollCapturePort = port;
+
+  port.onMessage.addListener((msg: { type: string; confirmed?: boolean }) => {
+    if (msg.type === 'START_SCROLL_CAPTURE') {
+      startScrollCapture().catch((err) => {
+        port.postMessage({ type: 'SCROLL_ERROR', error: String(err) });
+      });
+    } else if (msg.type === 'LARGE_PAGE_RESPONSE') {
+      if (pendingLargePageConfirm) {
+        pendingLargePageConfirm(msg.confirmed ?? false);
+        pendingLargePageConfirm = null;
+      }
+    }
+  });
+
+  port.onDisconnect.addListener(() => {
+    scrollCapturePort = null;
+    if (pendingLargePageConfirm) {
+      pendingLargePageConfirm(false); // unblock content script if popup closed
+      pendingLargePageConfirm = null;
+    }
+  });
+});
 
 interface CropRect {
   x: number;
@@ -57,6 +94,51 @@ chrome.runtime.onMessage.addListener((message: Message, _sender, sendResponse) =
     sendResponse({ ok: true });
     return false;
   }
+
+  if (message.type === 'SCROLL_CAPTURE_CHUNK') {
+    captureFullTab()
+      .then((dataUrl) => sendResponse({ dataUrl }))
+      .catch((err) => sendResponse({ error: String(err) }));
+    return true;
+  }
+
+  if (message.type === 'SCROLL_PROGRESS') {
+    scrollCapturePort?.postMessage({ type: 'SCROLL_PROGRESS', current: message.current, total: message.total });
+    sendResponse({ ok: true });
+    return false;
+  }
+
+  if (message.type === 'SCROLL_CONFIRM_LARGE') {
+    scrollCapturePort?.postMessage({ type: 'CONFIRM_LARGE_PAGE', totalHeight: message.totalHeight });
+    pendingLargePageConfirm = (confirmed: boolean) => sendResponse(confirmed);
+    return true; // keep channel open until popup responds
+  }
+
+  if (message.type === 'SCROLL_STITCH_CHUNKS') {
+    stitchChunks(message.chunks, message.totalHeight, message.viewportWidth, message.dpr)
+      .then(async (dataUrl) => {
+        const screenshot: Screenshot = {
+          id: crypto.randomUUID(),
+          dataUrl,
+          createdAt: Date.now(),
+        };
+        await saveScreenshot(screenshot);
+        await chrome.storage.session.set({ lastSaved: Date.now() });
+        scrollCapturePort?.postMessage({ type: 'SCROLL_COMPLETE' });
+        sendResponse({ ok: true });
+      })
+      .catch((err) => {
+        scrollCapturePort?.postMessage({ type: 'SCROLL_ERROR', error: String(err) });
+        sendResponse({ error: String(err) });
+      });
+    return true;
+  }
+
+  if (message.type === 'SCROLL_ERROR') {
+    scrollCapturePort?.postMessage({ type: 'SCROLL_ERROR', error: message.error });
+    sendResponse({ ok: true });
+    return false;
+  }
 });
 
 // Re-inject overlay when the active crop tab finishes navigating to a new page
@@ -73,6 +155,46 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
     // ignore
   }
 });
+
+async function startScrollCapture() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab?.id) return;
+  const tabUrl = tab.url ?? '';
+  if (
+    tabUrl.startsWith('chrome://') ||
+    tabUrl.startsWith('chrome-extension://') ||
+    tabUrl.startsWith('about:')
+  ) {
+    scrollCapturePort?.postMessage({ type: 'SCROLL_ERROR', error: "Can't capture this page type." });
+    return;
+  }
+  await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    files: ['content/full-page-capture.js'],
+  });
+}
+
+async function stitchChunks(
+  chunks: Array<{ dataUrl: string; scrollY: number }>,
+  totalHeight: number,
+  viewportWidth: number,
+  dpr: number
+): Promise<string> {
+  const canvasWidth = Math.round(viewportWidth * dpr);
+  const canvasHeight = Math.round(totalHeight * dpr);
+  const canvas = new OffscreenCanvas(canvasWidth, canvasHeight);
+  const ctx = canvas.getContext('2d')!;
+
+  for (const { dataUrl, scrollY } of chunks) {
+    const blob = await fetch(dataUrl).then((r) => r.blob());
+    const bitmap = await createImageBitmap(blob);
+    ctx.drawImage(bitmap, 0, Math.round(scrollY * dpr));
+    bitmap.close();
+  }
+
+  const blob = await canvas.convertToBlob({ type: 'image/png' });
+  return blobToDataUrl(blob);
+}
 
 async function captureFullTab(): Promise<string> {
   return new Promise((resolve, reject) => {
