@@ -171,21 +171,33 @@ async function stitchChunks(
   chunks: Array<{ dataUrl: string; scrollY: number }>,
   totalHeight: number,
   viewportWidth: number,
-  dpr: number
+  _dpr: number // not used — actual scale is derived from the captured bitmap dimensions
 ): Promise<string> {
-  const canvasWidth = Math.round(viewportWidth * dpr);
-  const canvasHeight = Math.round(totalHeight * dpr);
-  const canvas = new OffscreenCanvas(canvasWidth, canvasHeight);
-  const ctx = canvas.getContext('2d')!;
+  if (chunks.length === 0) throw new Error('No chunks to stitch');
+
+  // captureVisibleTab uses the ACTUAL screen DPR, not window.devicePixelRatio which
+  // reflects the emulated DPR in DevTools mobile emulation. Using the emulated DPR
+  // to size the canvas makes it too large, leaving empty space on the right.
+  // Instead we read the true pixel width off the first bitmap and derive scale from that.
+  let canvas: OffscreenCanvas | null = null;
+  let ctx: OffscreenCanvasRenderingContext2D | null = null;
+  let actualScale = 1;
 
   for (const { dataUrl, scrollY } of chunks) {
     const blob = await fetch(dataUrl).then((r) => r.blob());
     const bitmap = await createImageBitmap(blob);
-    ctx.drawImage(bitmap, 0, Math.round(scrollY * dpr));
+
+    if (!canvas) {
+      actualScale = bitmap.width / viewportWidth;
+      canvas = new OffscreenCanvas(bitmap.width, Math.round(totalHeight * actualScale));
+      ctx = canvas.getContext('2d')!;
+    }
+
+    ctx!.drawImage(bitmap, 0, Math.round(scrollY * actualScale));
     bitmap.close();
   }
 
-  const blob = await canvas.convertToBlob({ type: 'image/png' });
+  const blob = await canvas!.convertToBlob({ type: 'image/png' });
   return blobToDataUrl(blob);
 }
 
