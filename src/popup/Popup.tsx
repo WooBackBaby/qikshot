@@ -18,7 +18,6 @@ export function Popup() {
   const [capturing, setCapturing] = useState(false);
   const [scrollCapturing, setScrollCapturing] = useState(false);
   const [scrollProgress, setScrollProgress] = useState<{ current: number; total: number } | null>(null);
-  const [confirmLargePage, setConfirmLargePage] = useState<{ totalHeight: number } | null>(null);
   const [toast, setToast] = useState<Toast | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const toastTimer = useRef<ReturnType<typeof setTimeout>>();
@@ -105,14 +104,11 @@ export function Popup() {
         scrollPortRef.current = null;
         setScrollCapturing(false);
         setScrollProgress(null);
-        setConfirmLargePage(null);
       }
 
-      port.onMessage.addListener((msg: { type: string; current?: number; total?: number; totalHeight?: number; error?: string }) => {
+      port.onMessage.addListener((msg: { type: string; current?: number; total?: number; error?: string }) => {
         if (msg.type === 'SCROLL_PROGRESS') {
           setScrollProgress({ current: msg.current!, total: msg.total! });
-        } else if (msg.type === 'CONFIRM_LARGE_PAGE') {
-          setConfirmLargePage({ totalHeight: msg.totalHeight! });
         } else if (msg.type === 'SCROLL_COMPLETE') {
           teardown();
           port.disconnect();
@@ -135,11 +131,6 @@ export function Popup() {
       setScrollCapturing(false);
       setScrollProgress(null);
     }
-  }
-
-  function handleLargePageResponse(confirmed: boolean) {
-    setConfirmLargePage(null);
-    scrollPortRef.current?.postMessage({ type: 'LARGE_PAGE_RESPONSE', confirmed });
   }
 
   async function captureCrop() {
@@ -283,32 +274,6 @@ export function Popup() {
         </button>
       </div>
 
-      {/* Large page confirmation dialog */}
-      {confirmLargePage && (
-        <div className="absolute inset-0 bg-zinc-950/80 flex items-center justify-center z-40 px-6">
-          <div className="bg-zinc-900 border border-zinc-700 rounded-xl p-5 w-full shadow-xl">
-            <p className="text-sm font-semibold text-zinc-100 mb-1">Large page</p>
-            <p className="text-xs text-zinc-400 mb-4">
-              This page is {Math.round(confirmLargePage.totalHeight / 1000)}k px tall. Full capture
-              may take a while and use significant memory.
-            </p>
-            <div className="flex gap-2 justify-end">
-              <button
-                onClick={() => handleLargePageResponse(false)}
-                className="px-3 py-1.5 text-xs rounded-lg bg-zinc-800 text-zinc-300 hover:bg-zinc-700 transition-colors"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={() => handleLargePageResponse(true)}
-                className="px-3 py-1.5 text-xs rounded-lg bg-violet-600 text-white hover:bg-violet-500 transition-colors"
-              >
-                Capture anyway
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* Divider + count */}
       <div className="flex items-center gap-2 px-4 mb-1 flex-shrink-0">

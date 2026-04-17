@@ -18,7 +18,6 @@
     right: string;
   }
   const savedElements: SavedElement[] = [];
-  let aborted = false;
 
   function instantScrollTo(y: number) {
     window.scrollTo({ top: y, behavior: 'instant' as ScrollBehavior });
@@ -47,7 +46,6 @@
 
     const viewportWidth = window.innerWidth;
     const viewportHeight = window.innerHeight;
-    const dpr = window.devicePixelRatio;
 
     // Silent pre-scroll pass to trigger lazy-loaded content
     {
@@ -80,20 +78,13 @@
       }
     }
 
-    // Measure total height after pre-scroll (lazy content may have expanded page)
-    let totalHeight = document.documentElement.scrollHeight;
+    const totalHeight = document.documentElement.scrollHeight;
 
-    // Ask user to confirm capture of very tall pages
-    if (totalHeight > 15000) {
-      const confirmed = await chrome.runtime.sendMessage({
-        type: 'SCROLL_CONFIRM_LARGE',
-        totalHeight,
-      });
-      if (!confirmed) {
-        aborted = true;
-        return;
-      }
-    }
+    // Tell the background to prepare for this capture session.
+    // Each chunk is captured and drawn directly in the service worker so we never
+    // pass large data URLs through runtime messages (which have size limits and
+    // cause "failed to fetch" errors on long pages).
+    await chrome.runtime.sendMessage({ type: 'SCROLL_START', totalHeight, viewportWidth });
 
     // Calculate chunk scroll positions.
     // Every chunk except the last uses i * viewportHeight.
@@ -109,57 +100,36 @@
       }
     }
 
-    // Capture all chunks
-    const chunks: Array<{ dataUrl: string; scrollY: number }> = [];
-    let measuredHeight = totalHeight;
-    let i = 0;
-
-    while (i < scrollPositions.length) {
+    // Capture each chunk. The background handles the actual captureVisibleTab call
+    // and draws directly onto its OffscreenCanvas — no data URL is returned here.
+    for (let i = 0; i < scrollPositions.length; i++) {
       const scrollY = scrollPositions[i];
       instantScrollTo(scrollY);
       await wait(200);
 
       const resp = (await chrome.runtime.sendMessage({
         type: 'SCROLL_CAPTURE_CHUNK',
-      })) as { dataUrl: string };
-      chunks.push({ dataUrl: resp.dataUrl, scrollY });
+        scrollY,
+      })) as { ok?: boolean; error?: string };
+      if (resp?.error) throw new Error(resp.error);
 
       // Non-blocking progress update to popup
       chrome.runtime
         .sendMessage({ type: 'SCROLL_PROGRESS', current: i + 1, total: scrollPositions.length })
         .catch(() => {});
-
-      // If page grew (infinite scroll / dynamic content) extend the queue
-      const newHeight = document.documentElement.scrollHeight;
-      if (newHeight > measuredHeight && i === scrollPositions.length - 1) {
-        let nextY = scrollPositions[i] + viewportHeight;
-        while (nextY < newHeight - viewportHeight) {
-          scrollPositions.push(nextY);
-          nextY += viewportHeight;
-        }
-        scrollPositions.push(Math.max(0, newHeight - viewportHeight));
-        measuredHeight = newHeight;
-      }
-
-      i++;
     }
 
-    // Hand off to the background for stitching (done in OffscreenCanvas)
-    await chrome.runtime.sendMessage({
-      type: 'SCROLL_STITCH_CHUNKS',
-      chunks,
-      totalHeight: measuredHeight,
-      viewportWidth,
-      dpr,
-    });
+    // Ask the background to finalise: convert canvas → PNG → save to DB
+    const finalResp = (await chrome.runtime.sendMessage({
+      type: 'SCROLL_FINALIZE',
+    })) as { ok?: boolean; error?: string };
+    if (finalResp?.error) throw new Error(finalResp.error);
   }
 
   try {
     await run();
   } catch (e) {
-    if (!aborted) {
-      chrome.runtime.sendMessage({ type: 'SCROLL_ERROR', error: String(e) }).catch(() => {});
-    }
+    chrome.runtime.sendMessage({ type: 'SCROLL_ERROR', error: String(e) }).catch(() => {});
   } finally {
     // Restore all fixed/sticky elements
     for (const saved of savedElements) {

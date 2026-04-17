@@ -8,23 +8,30 @@ type Message =
   | { type: 'START_CROP' }
   | { type: 'CROP_CAPTURE'; cropRect: CropRect }
   | { type: 'CROP_DISMISSED' }
-  | { type: 'SCROLL_CAPTURE_CHUNK' }
+  | { type: 'SCROLL_START'; totalHeight: number; viewportWidth: number }
+  | { type: 'SCROLL_CAPTURE_CHUNK'; scrollY: number }
   | { type: 'SCROLL_PROGRESS'; current: number; total: number }
-  | { type: 'SCROLL_CONFIRM_LARGE'; totalHeight: number }
-  | { type: 'SCROLL_STITCH_CHUNKS'; chunks: Array<{ dataUrl: string; scrollY: number }>; totalHeight: number; viewportWidth: number; dpr: number }
+  | { type: 'SCROLL_FINALIZE' }
   | { type: 'SCROLL_ERROR'; error: string };
 
 // Long-lived port from the popup for scroll capture progress/control.
 // Keeping the port open prevents the service worker from going idle mid-capture.
 let scrollCapturePort: chrome.runtime.Port | null = null;
-let pendingLargePageConfirm: ((confirmed: boolean) => void) | null = null;
+
+// Incremental stitch canvas — built chunk-by-chunk in the service worker so we
+// never pass large data URLs through runtime messages (which have size limits).
+let stitchCanvas: OffscreenCanvas | null = null;
+let stitchCtx: OffscreenCanvasRenderingContext2D | null = null;
+let stitchTotalHeight = 0;
+let stitchViewportWidth = 0;
+let stitchActualScale = 0; // derived from first bitmap's real pixel dimensions
 
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== 'scroll-capture') return;
 
   scrollCapturePort = port;
 
-  port.onMessage.addListener((msg: { type: string; tabId?: number; confirmed?: boolean }) => {
+  port.onMessage.addListener((msg: { type: string; tabId?: number }) => {
     if (msg.type === 'START_SCROLL_CAPTURE') {
       if (!msg.tabId) {
         port.postMessage({ type: 'SCROLL_ERROR', error: 'No tab ID provided.' });
@@ -33,20 +40,11 @@ chrome.runtime.onConnect.addListener((port) => {
       startScrollCapture(msg.tabId).catch((err) => {
         port.postMessage({ type: 'SCROLL_ERROR', error: String(err) });
       });
-    } else if (msg.type === 'LARGE_PAGE_RESPONSE') {
-      if (pendingLargePageConfirm) {
-        pendingLargePageConfirm(msg.confirmed ?? false);
-        pendingLargePageConfirm = null;
-      }
     }
   });
 
   port.onDisconnect.addListener(() => {
     scrollCapturePort = null;
-    if (pendingLargePageConfirm) {
-      pendingLargePageConfirm(false); // unblock content script if popup closed
-      pendingLargePageConfirm = null;
-    }
   });
 });
 
@@ -99,9 +97,43 @@ chrome.runtime.onMessage.addListener((message: Message, _sender, sendResponse) =
     return false;
   }
 
+  if (message.type === 'SCROLL_START') {
+    // Reset stitch state for new capture session
+    stitchCanvas = null;
+    stitchCtx = null;
+    stitchActualScale = 0;
+    stitchTotalHeight = message.totalHeight;
+    stitchViewportWidth = message.viewportWidth;
+    sendResponse({ ok: true });
+    return false;
+  }
+
   if (message.type === 'SCROLL_CAPTURE_CHUNK') {
+    // Capture the visible tab and draw directly onto the stitch canvas.
+    // This avoids passing large data URLs through runtime messages, which
+    // can exceed Chrome's message size limit on long pages ("failed to fetch").
+    const { scrollY } = message;
     captureFullTab()
-      .then((dataUrl) => sendResponse({ dataUrl }))
+      .then(async (dataUrl) => {
+        const blob = await fetch(dataUrl).then((r) => r.blob());
+        const bitmap = await createImageBitmap(blob);
+
+        if (!stitchCanvas) {
+          // Derive the actual pixel scale from the real bitmap dimensions.
+          // captureVisibleTab uses the ACTUAL screen DPR, not window.devicePixelRatio
+          // (which reflects the emulated DPR in DevTools mobile emulation).
+          stitchActualScale = bitmap.width / stitchViewportWidth;
+          stitchCanvas = new OffscreenCanvas(
+            bitmap.width,
+            Math.round(stitchTotalHeight * stitchActualScale),
+          );
+          stitchCtx = stitchCanvas.getContext('2d')!;
+        }
+
+        stitchCtx!.drawImage(bitmap, 0, Math.round(scrollY * stitchActualScale));
+        bitmap.close();
+        sendResponse({ ok: true });
+      })
       .catch((err) => sendResponse({ error: String(err) }));
     return true;
   }
@@ -112,15 +144,14 @@ chrome.runtime.onMessage.addListener((message: Message, _sender, sendResponse) =
     return false;
   }
 
-  if (message.type === 'SCROLL_CONFIRM_LARGE') {
-    scrollCapturePort?.postMessage({ type: 'CONFIRM_LARGE_PAGE', totalHeight: message.totalHeight });
-    pendingLargePageConfirm = (confirmed: boolean) => sendResponse(confirmed);
-    return true; // keep channel open until popup responds
-  }
-
-  if (message.type === 'SCROLL_STITCH_CHUNKS') {
-    stitchChunks(message.chunks, message.totalHeight, message.viewportWidth, message.dpr)
-      .then(async (dataUrl) => {
+  if (message.type === 'SCROLL_FINALIZE') {
+    if (!stitchCanvas) {
+      sendResponse({ error: 'No canvas to finalise' });
+      return false;
+    }
+    stitchCanvas.convertToBlob({ type: 'image/png' })
+      .then(async (blob) => {
+        const dataUrl = await blobToDataUrl(blob);
         const screenshot: Screenshot = {
           id: crypto.randomUUID(),
           dataUrl,
@@ -129,6 +160,8 @@ chrome.runtime.onMessage.addListener((message: Message, _sender, sendResponse) =
         await saveScreenshot(screenshot);
         await chrome.storage.session.set({ lastSaved: Date.now() });
         scrollCapturePort?.postMessage({ type: 'SCROLL_COMPLETE' });
+        stitchCanvas = null;
+        stitchCtx = null;
         sendResponse({ ok: true });
       })
       .catch((err) => {
@@ -165,40 +198,6 @@ async function startScrollCapture(tabId: number) {
     target: { tabId },
     files: ['content/full-page-capture.js'],
   });
-}
-
-async function stitchChunks(
-  chunks: Array<{ dataUrl: string; scrollY: number }>,
-  totalHeight: number,
-  viewportWidth: number,
-  _dpr: number // not used — actual scale is derived from the captured bitmap dimensions
-): Promise<string> {
-  if (chunks.length === 0) throw new Error('No chunks to stitch');
-
-  // captureVisibleTab uses the ACTUAL screen DPR, not window.devicePixelRatio which
-  // reflects the emulated DPR in DevTools mobile emulation. Using the emulated DPR
-  // to size the canvas makes it too large, leaving empty space on the right.
-  // Instead we read the true pixel width off the first bitmap and derive scale from that.
-  let canvas: OffscreenCanvas | null = null;
-  let ctx: OffscreenCanvasRenderingContext2D | null = null;
-  let actualScale = 1;
-
-  for (const { dataUrl, scrollY } of chunks) {
-    const blob = await fetch(dataUrl).then((r) => r.blob());
-    const bitmap = await createImageBitmap(blob);
-
-    if (!canvas) {
-      actualScale = bitmap.width / viewportWidth;
-      canvas = new OffscreenCanvas(bitmap.width, Math.round(totalHeight * actualScale));
-      ctx = canvas.getContext('2d')!;
-    }
-
-    ctx!.drawImage(bitmap, 0, Math.round(scrollY * actualScale));
-    bitmap.close();
-  }
-
-  const blob = await canvas!.convertToBlob({ type: 'image/png' });
-  return blobToDataUrl(blob);
 }
 
 async function captureFullTab(): Promise<string> {
