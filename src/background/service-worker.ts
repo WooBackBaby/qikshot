@@ -24,9 +24,13 @@ chrome.runtime.onConnect.addListener((port) => {
 
   scrollCapturePort = port;
 
-  port.onMessage.addListener((msg: { type: string; confirmed?: boolean }) => {
+  port.onMessage.addListener((msg: { type: string; tabId?: number; confirmed?: boolean }) => {
     if (msg.type === 'START_SCROLL_CAPTURE') {
-      startScrollCapture().catch((err) => {
+      if (!msg.tabId) {
+        port.postMessage({ type: 'SCROLL_ERROR', error: 'No tab ID provided.' });
+        return;
+      }
+      startScrollCapture(msg.tabId).catch((err) => {
         port.postMessage({ type: 'SCROLL_ERROR', error: String(err) });
       });
     } else if (msg.type === 'LARGE_PAGE_RESPONSE') {
@@ -156,20 +160,9 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
   }
 });
 
-async function startScrollCapture() {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab?.id) return;
-  const tabUrl = tab.url ?? '';
-  if (
-    tabUrl.startsWith('chrome://') ||
-    tabUrl.startsWith('chrome-extension://') ||
-    tabUrl.startsWith('about:')
-  ) {
-    scrollCapturePort?.postMessage({ type: 'SCROLL_ERROR', error: "Can't capture this page type." });
-    return;
-  }
+async function startScrollCapture(tabId: number) {
   await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
+    target: { tabId },
     files: ['content/full-page-capture.js'],
   });
 }

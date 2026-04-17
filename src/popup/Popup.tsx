@@ -74,42 +74,67 @@ export function Popup() {
     }
   }
 
-  function captureScrollPage() {
-    setScrollCapturing(true);
-    setScrollProgress(null);
-
-    const port = chrome.runtime.connect({ name: 'scroll-capture' });
-    scrollPortRef.current = port;
-
-    port.onMessage.addListener((msg: { type: string; current?: number; total?: number; totalHeight?: number; error?: string }) => {
-      if (msg.type === 'SCROLL_PROGRESS') {
-        setScrollProgress({ current: msg.current!, total: msg.total! });
-      } else if (msg.type === 'CONFIRM_LARGE_PAGE') {
-        setConfirmLargePage({ totalHeight: msg.totalHeight! });
-      } else if (msg.type === 'SCROLL_COMPLETE') {
-        port.disconnect();
-        scrollPortRef.current = null;
-        setScrollCapturing(false);
-        setScrollProgress(null);
-        loadScreenshots();
-        showToast('Screenshot saved ✓');
-      } else if (msg.type === 'SCROLL_ERROR') {
-        port.disconnect();
-        scrollPortRef.current = null;
-        setScrollCapturing(false);
-        setScrollProgress(null);
-        showToast('Capture failed — please try again', 'error');
+  async function captureScrollPage() {
+    try {
+      // Query the tab here in the popup context — `currentWindow: true` correctly
+      // resolves to the browser window when called from a popup. If we let the
+      // service worker do this query while the popup is open, `currentWindow`
+      // resolves to the popup window (no tabs) and the query returns empty.
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      const url = tab?.url ?? '';
+      if (url.startsWith('chrome://') || url.startsWith('chrome-extension://') || url.startsWith('about:')) {
+        showToast("Can't capture this page type.", 'error');
+        return;
       }
-    });
+      if (!tab?.id) {
+        showToast('No active tab found.', 'error');
+        return;
+      }
 
-    port.onDisconnect.addListener(() => {
-      scrollPortRef.current = null;
+      setScrollCapturing(true);
+      setScrollProgress(null);
+
+      const port = chrome.runtime.connect({ name: 'scroll-capture' });
+      scrollPortRef.current = port;
+
+      let finished = false;
+
+      function teardown() {
+        if (finished) return;
+        finished = true;
+        scrollPortRef.current = null;
+        setScrollCapturing(false);
+        setScrollProgress(null);
+        setConfirmLargePage(null);
+      }
+
+      port.onMessage.addListener((msg: { type: string; current?: number; total?: number; totalHeight?: number; error?: string }) => {
+        if (msg.type === 'SCROLL_PROGRESS') {
+          setScrollProgress({ current: msg.current!, total: msg.total! });
+        } else if (msg.type === 'CONFIRM_LARGE_PAGE') {
+          setConfirmLargePage({ totalHeight: msg.totalHeight! });
+        } else if (msg.type === 'SCROLL_COMPLETE') {
+          teardown();
+          port.disconnect();
+          loadScreenshots();
+          showToast('Screenshot saved ✓');
+        } else if (msg.type === 'SCROLL_ERROR') {
+          teardown();
+          port.disconnect();
+          showToast(msg.error ? `Capture failed: ${msg.error}` : 'Capture failed — please try again', 'error');
+        }
+      });
+
+      port.onDisconnect.addListener(() => {
+        teardown();
+      });
+
+      port.postMessage({ type: 'START_SCROLL_CAPTURE', tabId: tab.id });
+    } catch (e) {
+      showToast('Capture failed — please try again', 'error');
       setScrollCapturing(false);
       setScrollProgress(null);
-      setConfirmLargePage(null);
-    });
-
-    port.postMessage({ type: 'START_SCROLL_CAPTURE' });
+    }
   }
 
   function handleLargePageResponse(confirmed: boolean) {
