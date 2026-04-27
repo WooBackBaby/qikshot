@@ -24,7 +24,11 @@ let stitchCanvas: OffscreenCanvas | null = null;
 let stitchCtx: OffscreenCanvasRenderingContext2D | null = null;
 let stitchTotalHeight = 0;
 let stitchViewportWidth = 0;
-let stitchActualScale = 0; // derived from first bitmap's real pixel dimensions
+let stitchActualScale = 0; // CSS px → canvas px (includes any clamp factor)
+let stitchBitmapScale = 1; // scale applied to each bitmap's drawn dimensions
+
+// Chrome's GPU texture dimension limit — canvases taller than this fail silently.
+const MAX_CANVAS_HEIGHT = 16384;
 
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== 'scroll-capture') return;
@@ -102,6 +106,7 @@ chrome.runtime.onMessage.addListener((message: Message, _sender, sendResponse) =
     stitchCanvas = null;
     stitchCtx = null;
     stitchActualScale = 0;
+    stitchBitmapScale = 1;
     stitchTotalHeight = message.totalHeight;
     stitchViewportWidth = message.viewportWidth;
     sendResponse({ ok: true });
@@ -122,15 +127,35 @@ chrome.runtime.onMessage.addListener((message: Message, _sender, sendResponse) =
           // Derive the actual pixel scale from the real bitmap dimensions.
           // captureVisibleTab uses the ACTUAL screen DPR, not window.devicePixelRatio
           // (which reflects the emulated DPR in DevTools mobile emulation).
-          stitchActualScale = bitmap.width / stitchViewportWidth;
+          const dpr = bitmap.width / stitchViewportWidth;
+          const rawHeight = Math.round(stitchTotalHeight * dpr);
+          if (rawHeight <= MAX_CANVAS_HEIGHT) {
+            // Normal case: full retina resolution.
+            stitchActualScale = dpr;
+            stitchBitmapScale = 1;
+          } else if (stitchTotalHeight <= MAX_CANVAS_HEIGHT) {
+            // Long page: drop to 1× (CSS pixels). Sharp output, just not retina density.
+            stitchActualScale = 1;
+            stitchBitmapScale = 1 / dpr;
+          } else {
+            // Extremely long page (>16384 CSS px): scale to fit — unavoidable quality loss.
+            stitchActualScale = MAX_CANVAS_HEIGHT / stitchTotalHeight;
+            stitchBitmapScale = stitchActualScale / dpr;
+          }
           stitchCanvas = new OffscreenCanvas(
-            bitmap.width,
+            Math.round(bitmap.width * stitchBitmapScale),
             Math.round(stitchTotalHeight * stitchActualScale),
           );
           stitchCtx = stitchCanvas.getContext('2d')!;
         }
 
-        stitchCtx!.drawImage(bitmap, 0, Math.round(scrollY * stitchActualScale));
+        stitchCtx!.drawImage(
+          bitmap,
+          0, 0, bitmap.width, bitmap.height,
+          0, Math.round(scrollY * stitchActualScale),
+          Math.round(bitmap.width * stitchBitmapScale),
+          Math.round(bitmap.height * stitchBitmapScale),
+        );
         bitmap.close();
         sendResponse({ ok: true });
       })
