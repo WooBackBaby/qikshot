@@ -41,7 +41,6 @@
     document.documentElement.style.scrollBehavior = 'instant';
     instantScrollTo(0);
     await waitFrame();
-    await wait(300);
 
     // Hide scrollbars during capture
     scrollbarStyle = document.createElement('style');
@@ -52,21 +51,29 @@
     const viewportWidth = window.innerWidth;
     const viewportHeight = window.innerHeight;
 
-    // Hide the page during the pre-scroll pass so the user doesn't see the page
-    // jumping to the bottom and back. opacity:0 keeps layout intact and lets
-    // IntersectionObserver / native lazy-loading still fire normally.
-    document.documentElement.style.opacity = '0';
+    // Pre-scroll only matters if the page has multiple viewports of content —
+    // anything within ~2 viewports is already in flight or visible, so pre-scroll
+    // adds latency for no benefit. Skip it entirely for short pages.
+    const initialHeight = document.documentElement.scrollHeight;
+    const needsPreScroll = initialHeight > viewportHeight * 2;
 
-    // Silent pre-scroll pass to trigger lazy-loaded content
-    {
+    if (needsPreScroll) {
+      // Hide the page during the pre-scroll pass so the user doesn't see it
+      // jumping. opacity:0 keeps layout intact and lets IntersectionObserver /
+      // native lazy-loading still fire normally.
+      document.documentElement.style.opacity = '0';
+
+      // Pre-scroll at frame cadence (no per-position setTimeout) — IntersectionObserver
+      // fires on layout, so a frame is enough. Then one settle pass at the end gives
+      // images time to start decoding before captures begin.
       let y = 0;
       while (y < document.documentElement.scrollHeight) {
         instantScrollTo(y);
-        await wait(100);
+        await waitFrame();
         y += viewportHeight;
       }
       instantScrollTo(0);
-      await wait(300);
+      await wait(150);
     }
 
     // Pin all fixed/sticky elements to their current visual position so they
@@ -138,7 +145,11 @@
     for (let i = 0; i < scrollPositions.length; i++) {
       const scrollY = scrollPositions[i];
       instantScrollTo(scrollY);
-      await wait(200);
+      // Wait for layout settle after instant scroll. waitFrame alone misses some
+      // CSS transitions; 80ms covers nearly all real-world cases without the
+      // old 200ms padding that doubled total capture time on short pages.
+      await waitFrame();
+      await wait(80);
 
       const resp = (await chrome.runtime.sendMessage({
         type: 'SCROLL_CAPTURE_CHUNK',
