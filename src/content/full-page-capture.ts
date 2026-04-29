@@ -17,6 +17,10 @@
     bottom: string;
     left: string;
     right: string;
+    width: string;
+    height: string;
+    maxWidth: string;
+    minWidth: string;
   }
   const savedElements: SavedElement[] = [];
 
@@ -65,12 +69,18 @@
       await wait(300);
     }
 
-    // Hide all fixed/sticky elements while the page is still invisible,
-    // so the user never sees the navbars/headers disappear.
+    // Pin all fixed/sticky elements to their current visual position so they
+    // appear once at the top of the stitched screenshot rather than following
+    // the scroll. We're at scrollY=0 here, so the bounding rect IS the document
+    // position. Capture exact width/height so absolute positioning doesn't let
+    // the element collapse to a narrower containing block — that's why navbars
+    // were shrinking on some sites (fixed sizes vs viewport, absolute sizes vs
+    // nearest positioned ancestor).
     const allEls = document.querySelectorAll<HTMLElement>('*');
     for (const el of Array.from(allEls)) {
       const cs = getComputedStyle(el);
       if (cs.position === 'fixed' || cs.position === 'sticky') {
+        const rect = el.getBoundingClientRect();
         savedElements.push({
           el,
           position: el.style.position,
@@ -79,9 +89,21 @@
           bottom: el.style.bottom,
           left: el.style.left,
           right: el.style.right,
+          width: el.style.width,
+          height: el.style.height,
+          maxWidth: el.style.maxWidth,
+          minWidth: el.style.minWidth,
         });
         el.style.position = 'absolute';
         el.style.transform = 'none';
+        el.style.top = `${rect.top + window.scrollY}px`;
+        el.style.left = `${rect.left + window.scrollX}px`;
+        el.style.right = 'auto';
+        el.style.bottom = 'auto';
+        el.style.width = `${rect.width}px`;
+        el.style.height = `${rect.height}px`;
+        el.style.maxWidth = 'none';
+        el.style.minWidth = '0';
       }
     }
 
@@ -150,6 +172,10 @@
       saved.el.style.bottom = saved.bottom;
       saved.el.style.left = saved.left;
       saved.el.style.right = saved.right;
+      saved.el.style.width = saved.width;
+      saved.el.style.height = saved.height;
+      saved.el.style.maxWidth = saved.maxWidth;
+      saved.el.style.minWidth = saved.minWidth;
     }
     // Remove scrollbar hide style
     if (scrollbarStyle?.parentNode) {

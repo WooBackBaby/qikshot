@@ -225,13 +225,61 @@ async function startScrollCapture(tabId: number) {
   });
 }
 
-async function captureFullTab(): Promise<string> {
+function captureVisibleTabOnce(): Promise<string> {
   return new Promise((resolve, reject) => {
     chrome.tabs.captureVisibleTab({ format: 'png' }, (dataUrl) => {
       if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
       else resolve(dataUrl);
     });
   });
+}
+
+// Chrome enforces a token-bucket quota on captureVisibleTab: ~25-call burst,
+// refilled at chrome.tabs.MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND (=2/sec).
+// Tripping it returns "MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND quota exceeded".
+// We mirror the bucket locally so long-page captures stay fast on the burst,
+// then auto-throttle to 2/sec — no errors, minimum total time.
+const CAPTURE_BUCKET_CAPACITY = 20; // leave 5-call margin under Chrome's ~25
+const CAPTURE_REFILL_PER_SEC = 2;
+let captureTokens = CAPTURE_BUCKET_CAPACITY;
+let captureLastRefill = 0;
+
+async function awaitCaptureToken(): Promise<void> {
+  const now = Date.now();
+  if (captureLastRefill === 0) captureLastRefill = now;
+  const elapsedSec = (now - captureLastRefill) / 1000;
+  captureTokens = Math.min(
+    CAPTURE_BUCKET_CAPACITY,
+    captureTokens + elapsedSec * CAPTURE_REFILL_PER_SEC,
+  );
+  captureLastRefill = now;
+  if (captureTokens < 1) {
+    const waitMs = Math.ceil(((1 - captureTokens) / CAPTURE_REFILL_PER_SEC) * 1000);
+    await new Promise((r) => setTimeout(r, waitMs));
+    const after = Date.now();
+    captureTokens += ((after - captureLastRefill) / 1000) * CAPTURE_REFILL_PER_SEC;
+    captureLastRefill = after;
+  }
+  captureTokens -= 1;
+}
+
+async function captureFullTab(): Promise<string> {
+  // Proactive throttle prevents quota errors. Retry is a safety net for cases
+  // where another extension is also calling captureVisibleTab on this tab.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await awaitCaptureToken();
+    try {
+      return await captureVisibleTabOnce();
+    } catch (err) {
+      const msg = String((err as Error)?.message ?? err);
+      const isQuota = /quota|MAX_CAPTURE/i.test(msg);
+      if (!isQuota || attempt === 2) throw err;
+      captureTokens = 0;
+      captureLastRefill = Date.now();
+      await new Promise((r) => setTimeout(r, 1100));
+    }
+  }
+  throw new Error('captureFullTab: retries exhausted');
 }
 
 async function startCrop() {
